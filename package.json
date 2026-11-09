@@ -1,0 +1,14 @@
+{
+  "name": "factory-management-erp",
+  "private": true,
+  "scripts": {
+    "dev:api": "npm --prefix api run start:dev",
+    "dev:mobile": "npm --prefix mobile run start",
+    "build:api": "npm --prefix api run build",
+    "check:mobile": "npm --prefix mobile run typecheck"
+  },
+  "devDependencies": {
+    "@types/react": "~19.3.0",
+    "typescript": "~6.0.3"
+  }
+}
