@@ -68,9 +68,9 @@ const publishableKey = process.env.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY;
 const TEMPORARY_CREDENTIALS_KEY = 'cocoa-erp.temporary-credentials.v1';
 const TEMPORARY_CREDENTIALS_TTL_MS = 24 * 60 * 60 * 1000;
 const apiUrl =
-  Platform.OS === 'web'
-    ? process.env.EXPO_PUBLIC_WEB_API_URL ?? 'http://localhost:3000/api'
-    : process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3000/api';
+  process.env.EXPO_PUBLIC_API_URL ??
+  (Platform.OS === 'web' ? process.env.EXPO_PUBLIC_WEB_API_URL : undefined) ??
+  'http://localhost:3000/api';
 
 type Screen = 'loading' | 'auth' | 'pending' | 'connection-error' | 'email-setup' | 'admin' | 'manager' | 'worker';
 type ApiError = { message?: string | string[] };
@@ -855,16 +855,19 @@ function AppShell() {
         });
       } catch (cause) {
         if (requestTimedOut || (cause instanceof Error && cause.name === 'AbortError')) {
-          throw new Error('The API request timed out. Check the backend connection to MongoDB Atlas and try again.');
+          throw new Error('The API request timed out. Check your internet connection and try again. The API may be starting after a period of inactivity.');
         }
         if (cause instanceof TypeError) {
-          throw new Error('Network problem');
+          throw new Error(`Unable to reach the API at ${apiUrl}. Check your internet connection and try again.`);
         }
         throw cause;
       } finally {
         clearTimeout(requestTimeout);
       }
       if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error('Your session has expired. Please sign out and sign in again.');
+        }
         const body = (await response.json().catch(() => ({}))) as ApiError;
         const message = Array.isArray(body.message)
           ? body.message.join(', ')
