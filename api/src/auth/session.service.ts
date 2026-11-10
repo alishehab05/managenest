@@ -31,6 +31,7 @@ export class SessionService {
 
     const account = await this.accounts
       .findOne({ clerkUserId, status: 'active' })
+      .select('-specialties')
       .populate('companyId', 'name status baseCurrencyId')
       .lean();
     if (account) {

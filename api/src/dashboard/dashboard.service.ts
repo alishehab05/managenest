@@ -6,7 +6,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { InjectConnection } from '@nestjs/mongoose';
-import type { Document as MongoDocument } from 'mongodb';
+import type { ClientSession, Document as MongoDocument } from 'mongodb';
 import type { Connection } from 'mongoose';
 import { Types } from 'mongoose';
 import { CompaniesService } from '../companies/companies.service.js';
@@ -134,11 +134,32 @@ const REQUIRED_MODULE_FIELDS: Record<string, string[]> = {
     'amount',
     'currencyCode',
   ],
-  fuelLogs: ['warehouseId', 'truckId', 'quantityLiters', 'unitPrice', 'currencyCode'],
+  truckExpenses: [
+    'warehouseId',
+    'truckId',
+    'category',
+    'amount',
+    'currencyCode',
+  ],
+  fuelLogs: ['truckId', 'quantityLiters', 'unitPrice', 'currencyCode'],
   maintenance: ['warehouseId', 'truckId', 'description'],
   materials: ['warehouseId', 'name', 'quantityOnHand', 'unitCost'],
   materialMovements: ['warehouseId', 'materialId', 'movementType', 'quantity'],
 };
+const DEFAULT_EXPENSE_CATEGORIES = [
+  { code: 'FUEL', name: 'Fuel' },
+  { code: 'MAINTENANCE', name: 'Maintenance' },
+  { code: 'REPAIRS', name: 'Repairs' },
+  { code: 'TRANSPORT', name: 'Transport' },
+  { code: 'LOADING', name: 'Loading' },
+  { code: 'STORAGE', name: 'Storage' },
+  { code: 'LABOR', name: 'Labor' },
+  { code: 'QUALITY', name: 'Quality' },
+  { code: 'INSURANCE', name: 'Insurance' },
+  { code: 'UTILITIES', name: 'Utilities' },
+  { code: 'SUPPLIES', name: 'Supplies' },
+  { code: 'OTHER', name: 'Other' },
+] as const;
 const ENUM_FIELDS: Record<string, Record<string, string[]>> = {
   cocoaLots: { status: ['available', 'depleted', 'quarantined'] },
   stockMovements: { movementType: ['incoming', 'outgoing', 'transfer'] },
@@ -490,25 +511,32 @@ export class DashboardService {
   async getCompanyExpenses(clerkUserId: string, filters: ExpenseFilters = {}) {
     const companyId = await this.companyIdForUser(clerkUserId);
     const currencyCode = await this.companyCurrency(companyId);
+    const expenseFilter = this.expenseDocumentFilter(filters);
+    const legacyConversion = await this.convertUnconvertedCompanyExpenses(clerkUserId);
     const match = {
       companyId,
-      ...this.expenseDocumentFilter(filters),
+      ...expenseFilter,
     };
-    const [total, records, count] = await Promise.all([
-      this.sum('expenses', companyId, this.companyExpenseAmount(currencyCode), this.expenseDocumentFilter(filters)),
-      this.db.collection('expenses')
-        .find(match)
-        .sort({ incurredAt: -1 })
-        .limit(200)
-        .toArray(),
-      this.db.collection('expenses').countDocuments(match),
+    const [total, records, countRows] = await Promise.all([
+      this.sum('expenses', companyId, this.companyExpenseAmount(currencyCode), expenseFilter, true),
+      this.db.collection('expenses').aggregate([
+        ...this.expensePipeline(match, true),
+        { $sort: { incurredAt: -1 } },
+        { $limit: 200 },
+      ]).toArray(),
+      this.db.collection('expenses').aggregate<{ count: number }>([
+        ...this.expensePipeline(match, true),
+        { $count: 'count' },
+      ]).toArray(),
     ]);
+    const count = countRows[0]?.count ?? 0;
     return {
       total,
       count,
       limit: 200,
       currencyCode,
-      unconvertedCount: await this.unconvertedExpenseCount(companyId, currencyCode, filters),
+      unconvertedCount: await this.unconvertedExpenseCount(companyId, currencyCode, filters, true),
+      conversionError: legacyConversion.conversionError,
       records: records.map((expense) => ({
         id: expense._id.toString(),
         category: expense.category,
@@ -580,6 +608,7 @@ export class DashboardService {
       trucks: 'warehouseId',
       trips: 'warehouseId',
       expenses: 'warehouseId',
+      truckExpenses: 'warehouseId',
       cocoaLots: 'warehouseId',
       stockMovements: 'warehouseId',
       materials: 'warehouseId',
@@ -627,11 +656,20 @@ export class DashboardService {
   ) {
     const companyId = await this.companyIdForUser(clerkUserId);
     collectionName = this.companyCollectionName(collectionName);
+    if (collectionName === 'expenseCategories') {
+      await this.ensureDefaultExpenseCategories(companyId);
+    }
     const filter: MongoDocument = { companyId };
     if (collectionName === 'accounts') {
       filter.role = 'driver';
       filter.status = 'active';
-    } else if (collectionName === 'warehouses' || collectionName === 'expenseCategories' || collectionName === 'trucks') {
+    } else if (collectionName === 'expenseCategories') {
+      filter.$or = [
+        { status: 'active' },
+        { status: { $exists: false } },
+        { status: null },
+      ];
+    } else if (collectionName === 'warehouses' || collectionName === 'trucks') {
       filter.status = 'active';
     }
     const options = await this.db.collection(collectionName)
@@ -640,6 +678,41 @@ export class DashboardService {
       .limit(500)
       .toArray();
     return options.map((record) => this.sanitizeModuleRecord(record));
+  }
+
+  private async ensureDefaultExpenseCategories(companyId: Types.ObjectId): Promise<void> {
+    const categories = this.db.collection('expenseCategories');
+    const existing = await categories.find(
+      { companyId },
+      { projection: { name: 1, code: 1 } },
+    ).toArray();
+    const names = new Set(
+      existing
+        .filter((category) => typeof category.name === 'string')
+        .map((category) => category.name.trim().toLowerCase()),
+    );
+    const codes = new Set(
+      existing
+        .filter((category) => typeof category.code === 'string')
+        .map((category) => category.code.trim().toUpperCase()),
+    );
+    const missing = DEFAULT_EXPENSE_CATEGORIES.filter((category) =>
+      !names.has(category.name.toLowerCase()) && !codes.has(category.code),
+    );
+    const now = new Date();
+    await Promise.all(missing.map((category) => categories.updateOne(
+      { companyId, code: category.code },
+      {
+        $setOnInsert: {
+          companyId,
+          ...category,
+          status: 'active',
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+      { upsert: true },
+    )));
   }
 
   async createCompanyModuleRecord(
@@ -656,6 +729,13 @@ export class DashboardService {
       : undefined;
     if (!warehouseId && this.supportsWarehouseRecords(collectionName) && typeof input.warehouseId === 'string') {
       warehouseId = await this.requireCompanyWarehouseId(companyId, input.warehouseId);
+    }
+    const truckWarehouseId = await this.truckLinkedWarehouseId(companyId, collectionName, input);
+    if (truckWarehouseId) {
+      if (warehouseId && !warehouseId.equals(truckWarehouseId)) {
+        throw new BadRequestException('Truck expenses must be assigned to the truck’s warehouse');
+      }
+      warehouseId = truckWarehouseId;
     }
     const record = this.prepareModuleRecord(
       warehouseId ? { ...input, warehouseId } : input,
@@ -684,6 +764,9 @@ export class DashboardService {
       companyId,
     });
     if (!saved) throw new Error('Created record could not be reloaded');
+    if (collectionName === 'trucks') {
+      await this.syncDriverWarehouseAssignments(companyId, [saved.driverId]);
+    }
     return this.sanitizeModuleRecord(saved);
   }
 
@@ -704,15 +787,55 @@ export class DashboardService {
     const warehouseId = warehouseIdInput && this.supportsWarehouseRecords(collectionName)
       ? await this.requireCompanyWarehouseId(companyId, warehouseIdInput)
       : undefined;
-    if (warehouseId) {
-      const existing = await this.db.collection(collectionName).findOne({
+    const record = this.prepareModuleRecord(input, collectionName, false);
+    const needsExistingRecord = Boolean(warehouseId) ||
+      collectionName === 'trucks' ||
+      collectionName === 'expenses' ||
+      collectionName === 'fuelLogs' ||
+      this.isTruckLinkedRecord(collectionName, record);
+    const existing = needsExistingRecord
+      ? await this.db.collection(collectionName).findOne({
         _id: recordId,
         companyId,
-        warehouseId,
-      }, { projection: { _id: 1 } });
-      if (!existing) throw new NotFoundException('Company record not found in this warehouse');
+        ...(warehouseId ? { warehouseId } : {}),
+      }, {
+        projection: {
+          _id: 1,
+          warehouseId: 1,
+          truckId: 1,
+          costCenterType: 1,
+          costCenterId: 1,
+          driverId: 1,
+        },
+      })
+      : null;
+    if (needsExistingRecord && !existing) {
+      throw new NotFoundException(warehouseId
+        ? 'Company record not found in this warehouse'
+        : 'Company record not found');
     }
-    const record = this.prepareModuleRecord(input, collectionName, false);
+    const effectiveRecord = { ...existing, ...record };
+    const truckLinked = this.isTruckLinkedRecord(collectionName, effectiveRecord);
+    if (truckLinked) {
+      const linkedWarehouseId = await this.truckLinkedWarehouseId(
+        companyId,
+        collectionName,
+        effectiveRecord,
+        existing ?? undefined,
+      );
+      if (linkedWarehouseId) {
+        if (warehouseId && !warehouseId.equals(linkedWarehouseId)) {
+          throw new BadRequestException('Truck expenses must be assigned to the truck’s warehouse');
+        }
+        if (typeof record.warehouseId === 'string') {
+          const requestedWarehouseId = await this.requireCompanyWarehouseId(companyId, record.warehouseId);
+          if (!requestedWarehouseId.equals(linkedWarehouseId)) {
+            throw new BadRequestException('Truck expenses must be assigned to the truck’s warehouse');
+          }
+        }
+        record.warehouseId = linkedWarehouseId;
+      }
+    }
     if (warehouseId && 'warehouseId' in record) {
       const requestedWarehouseId = this.validObjectId(String(record.warehouseId), 'warehouseId');
       if (!requestedWarehouseId.equals(warehouseId)) {
@@ -723,7 +846,7 @@ export class DashboardService {
     const normalized = await this.normalizeModuleRecord(record, companyId);
     this.normalizeModuleSpecificValues(collectionName, normalized);
     if (
-      ['expenses', 'fuelLogs'].includes(collectionName) &&
+      ['expenses', 'truckExpenses', 'fuelLogs'].includes(collectionName) &&
       ['amount', 'quantityLiters', 'unitPrice', 'currencyCode'].some((field) => field in normalized)
     ) {
       const current = await this.db.collection(collectionName).findOne(
@@ -753,6 +876,9 @@ export class DashboardService {
       ...(warehouseId ? { warehouseId } : {}),
     });
     if (!updated) throw new Error('Updated record could not be reloaded');
+    if (collectionName === 'trucks') {
+      await this.syncDriverWarehouseAssignments(companyId, [existing?.driverId, updated.driverId]);
+    }
     return this.sanitizeModuleRecord(updated);
   }
 
@@ -772,7 +898,7 @@ export class DashboardService {
     const collection = this.db.collection(collectionName);
     const exists = await collection.findOne(
       { _id: recordId, companyId, ...(warehouseId ? { warehouseId } : {}) },
-      { projection: { _id: 1 } },
+      { projection: collectionName === 'trucks' ? { _id: 1, driverId: 1 } : { _id: 1 } },
     );
     if (!exists) throw new NotFoundException('Company record not found');
 
@@ -801,6 +927,9 @@ export class DashboardService {
     }
 
     await collection.deleteOne({ _id: recordId, companyId, ...(warehouseId ? { warehouseId } : {}) });
+    if (collectionName === 'trucks') {
+      await this.syncDriverWarehouseAssignments(companyId, [exists.driverId]);
+    }
     return { deleted: true, id: recordId.toString() };
   }
 
@@ -838,7 +967,7 @@ export class DashboardService {
     let convertedCount = 0;
     let conversionError: string | undefined;
 
-    for (const collectionName of ['expenses', 'fuelLogs']) {
+    for (const collectionName of ['expenses', 'truckExpenses', 'fuelLogs']) {
       const records = await this.db.collection(collectionName)
         .find({
           companyId,
@@ -846,14 +975,14 @@ export class DashboardService {
           $or: [{ baseAmount: null }, { baseAmount: { $exists: false } }],
           ...(collectionName === 'fuelLogs' ? { expenseId: null } : {}),
         })
-        .sort({ [collectionName === 'expenses' ? 'incurredAt' : 'occurredAt']: 1 })
+        .sort({ [collectionName === 'fuelLogs' ? 'occurredAt' : 'incurredAt']: 1 })
         .limit(batchLimit)
         .toArray();
 
       for (const record of records) {
         const currencyCode = String(record.currencyCode ?? '').toUpperCase();
         const transactionDate = record[
-          collectionName === 'expenses' ? 'incurredAt' : 'occurredAt'
+          collectionName === 'fuelLogs' ? 'occurredAt' : 'incurredAt'
         ];
         if (!(transactionDate instanceof Date) || Number.isNaN(transactionDate.getTime())) {
           throw new BadRequestException(
@@ -882,9 +1011,9 @@ export class DashboardService {
             throw cause;
           }
         }
-        const amountValues = collectionName === 'expenses'
-          ? [String(record.amount)]
-          : [String(record.quantityLiters), String(record.unitPrice)];
+        const amountValues = collectionName === 'fuelLogs'
+          ? [String(record.quantityLiters), String(record.unitPrice)]
+          : [String(record.amount)];
         const baseAmount = decimalProductToCents([
           ...amountValues,
           exchangeRate.toFixed(10),
@@ -895,13 +1024,13 @@ export class DashboardService {
             companyId,
             currencyCode: record.currencyCode,
             baseAmount: null,
-            ...(collectionName === 'expenses'
-              ? { amount: record.amount }
-              : {
+            ...(collectionName === 'fuelLogs'
+              ? {
                 quantityLiters: record.quantityLiters,
                 unitPrice: record.unitPrice,
                 expenseId: null,
-              }),
+              }
+              : { amount: record.amount }),
           },
           {
             $set: {
@@ -985,11 +1114,15 @@ export class DashboardService {
         warehouseId,
       }).sort({ createdAt: -1 }).toArray(),
       this.expenseGroups(companyId, 'category', expenseMatch, currencyCode, true),
-      this.db.collection('expenses').find({
-        companyId,
-        warehouseId,
-        ...this.expenseDocumentFilter(filters),
-      }).sort({ incurredAt: -1 }).limit(200).toArray(),
+      this.db.collection('expenses').aggregate([
+        ...this.expensePipeline({
+          companyId,
+          warehouseId,
+          ...this.expenseDocumentFilter(filters),
+        }, true),
+        { $sort: { incurredAt: -1 } },
+        { $limit: 200 },
+      ]).toArray(),
       this.count('materials', companyId, { warehouseId }),
       this.count('materialMovements', companyId, { warehouseId }),
       this.db.collection('materials').find({ companyId, warehouseId })
@@ -1286,6 +1419,11 @@ export class DashboardService {
           },
           { session },
         );
+        await this.syncDriverWarehouseAssignments(
+          companyId,
+          [truck.driverId],
+          session,
+        );
       });
     } finally {
       await session.endSession();
@@ -1341,6 +1479,7 @@ export class DashboardService {
       'trucks',
       'trips',
       'expenses',
+      'truckExpenses',
       'cocoaLots',
       'stockMovements',
       'materials',
@@ -1357,6 +1496,74 @@ export class DashboardService {
       'customerPayments',
       'customerAdvances',
     ]).has(collectionName);
+  }
+
+  private isTruckLinkedRecord(
+    collectionName: string,
+    record: Record<string, unknown>,
+  ): boolean {
+    return collectionName === 'fuelLogs' || collectionName === 'truckExpenses' ||
+      (collectionName === 'expenses' && record.costCenterType === 'truck');
+  }
+
+  private async truckLinkedWarehouseId(
+    companyId: Types.ObjectId,
+    collectionName: string,
+    record: Record<string, unknown>,
+    existing?: Record<string, unknown>,
+  ): Promise<Types.ObjectId | undefined> {
+    if (!this.isTruckLinkedRecord(collectionName, record)) return undefined;
+    const truckIdInput = collectionName === 'expenses' ? record.costCenterId : record.truckId;
+    const truckId = this.validObjectId(String(truckIdInput ?? ''), collectionName === 'expenses' ? 'costCenterId' : 'truckId');
+    const existingTruckId = collectionName === 'expenses' ? existing?.costCenterId : existing?.truckId;
+    const sameTruck = existingTruckId instanceof Types.ObjectId && existingTruckId.equals(truckId);
+    if (sameTruck && existing?.warehouseId instanceof Types.ObjectId) {
+      return existing.warehouseId;
+    }
+
+    const truck = await this.db.collection('trucks').findOne(
+      { _id: truckId, companyId, status: 'active' },
+      { projection: { warehouseId: 1 } },
+    );
+    if (!truck || !(truck.warehouseId instanceof Types.ObjectId)) {
+      throw new BadRequestException('Truck expenses must reference an active company truck with a warehouse');
+    }
+    return truck.warehouseId;
+  }
+
+  private async syncDriverWarehouseAssignments(
+    companyId: Types.ObjectId,
+    driverIds: unknown[],
+    session?: ClientSession,
+  ): Promise<void> {
+    const uniqueDriverIds = new Map<string, Types.ObjectId>();
+    for (const value of driverIds) {
+      const id = value instanceof Types.ObjectId
+        ? value
+        : typeof value === 'string' && Types.ObjectId.isValid(value)
+          ? new Types.ObjectId(value)
+          : null;
+      if (id) uniqueDriverIds.set(id.toString(), id);
+    }
+
+    for (const driverId of uniqueDriverIds.values()) {
+      const trucks = await this.db.collection('trucks').find(
+        { companyId, driverId, status: 'active' },
+        { projection: { warehouseId: 1 }, ...(session ? { session } : {}) },
+      ).toArray();
+      const warehouseIds = [
+        ...new Map(
+          trucks
+            .filter((truck) => truck.warehouseId instanceof Types.ObjectId)
+            .map((truck) => [truck.warehouseId.toString(), truck.warehouseId]),
+        ).values(),
+      ];
+      await this.db.collection('accounts').updateOne(
+        { _id: driverId, companyId, role: 'driver' },
+        { $set: { warehouseIds, updatedAt: new Date() } },
+        session ? { session } : {},
+      );
+    }
   }
 
   private prepareModuleRecord(
@@ -1392,6 +1599,7 @@ export class DashboardService {
       const defaults: Record<string, Record<string, unknown>> = {
         warehouses: { status: 'active', location: '', address: '', lowStockThresholdKg: null },
         cocoaLots: { status: 'available' },
+        expenseCategories: { status: 'active' },
         stockMovements: { occurredAt: now },
         trucks: { status: 'active', driverId: null, assetId: null },
         trips: {
@@ -1407,6 +1615,12 @@ export class DashboardService {
           truckId: null,
           tripId: null,
           paymentStatus: 'unpaid',
+          incurredAt: now,
+        },
+        truckExpenses: {
+          baseAmount: null,
+          exchangeRate: null,
+          tripId: null,
           incurredAt: now,
         },
         fuelLogs: { tripId: null, expenseId: null, occurredAt: now },
@@ -1446,19 +1660,19 @@ export class DashboardService {
       record.lotNumber = record.lotNumber.trim();
     }
     if (
-      ['expenses', 'fuelLogs'].includes(collectionName) &&
+      ['expenses', 'truckExpenses', 'fuelLogs'].includes(collectionName) &&
       typeof record.currencyCode === 'string'
     ) {
       record.currencyCode = record.currencyCode.trim().toUpperCase();
     }
     if (
-      ['expenses', 'fuelLogs'].includes(collectionName) &&
+      ['expenses', 'truckExpenses', 'fuelLogs'].includes(collectionName) &&
       record.currencyCode !== undefined &&
       (typeof record.currencyCode !== 'string' || !/^[A-Z]{3}$/.test(record.currencyCode))
     ) {
       throw new BadRequestException('Currency code must be a three-letter ISO code');
     }
-    if (collectionName === 'expenses' && typeof record.category === 'string') {
+    if (['expenses', 'truckExpenses'].includes(collectionName) && typeof record.category === 'string') {
       record.category = record.category.trim().toLowerCase();
     }
   }
@@ -1482,13 +1696,26 @@ export class DashboardService {
       if (key.startsWith('$') || key.includes('.') || SENSITIVE_FIELD.test(key)) {
         throw new BadRequestException(`The field "${key}" is not allowed`);
       }
+      if (
+        value instanceof Types.ObjectId ||
+        value instanceof Types.Decimal128 ||
+        value instanceof Date
+      ) {
+        normalized[key] = value;
+        continue;
+      }
       if (value && typeof value === 'object' && !Array.isArray(value)) {
         normalized[key] = this.normalizeRecordValues(value as Record<string, unknown>);
         continue;
       }
       if (Array.isArray(value)) {
         normalized[key] = value.map((item) =>
-          item && typeof item === 'object' && !Array.isArray(item)
+          item &&
+          typeof item === 'object' &&
+          !Array.isArray(item) &&
+          !(item instanceof Types.ObjectId) &&
+          !(item instanceof Types.Decimal128) &&
+          !(item instanceof Date)
             ? this.normalizeRecordValues(item as Record<string, unknown>)
             : item,
         );
@@ -1518,6 +1745,9 @@ export class DashboardService {
   ): Promise<unknown> {
     if (Array.isArray(value)) {
       return Promise.all(value.map((item) => this.normalizeModuleValue(key, item, companyId, context)));
+    }
+    if (value instanceof Types.ObjectId || value instanceof Types.Decimal128) {
+      return value;
     }
     if (value && typeof value === 'object' && !(value instanceof Date)) {
       return this.normalizeModuleRecord(value as Record<string, unknown>, companyId);
@@ -1667,6 +1897,23 @@ export class DashboardService {
 
   private expensePipeline(match: MongoDocument, includeFuelLogs: boolean): MongoDocument[] {
     const pipeline: MongoDocument[] = [{ $match: match }];
+    if (includeFuelLogs && !('paymentStatus' in match)) {
+      pipeline.push({
+        $unionWith: {
+          coll: 'truckExpenses',
+          pipeline: [
+            { $match: match },
+            {
+              $addFields: {
+                costCenterType: 'truck',
+                costCenterId: '$truckId',
+                paymentStatus: { $ifNull: ['$paymentStatus', 'unpaid'] },
+              },
+            },
+          ],
+        },
+      });
+    }
     const fuelLogMatch = includeFuelLogs ? this.fuelLogMatch(match) : null;
     if (!fuelLogMatch) return pipeline;
     pipeline.push({
@@ -1858,16 +2105,16 @@ export class DashboardService {
     collectionName: string,
     record: Record<string, unknown>,
   ): Promise<void> {
-    if (!['expenses', 'fuelLogs'].includes(collectionName)) return;
+    if (!['expenses', 'truckExpenses', 'fuelLogs'].includes(collectionName)) return;
     const currencyCode = String(record.currencyCode ?? '').toUpperCase();
     const baseCurrencyCode = await this.companyCurrency(companyId);
     if (!/^[A-Z]{3}$/.test(currencyCode)) {
       throw new BadRequestException('Currency code must be a three-letter ISO code');
     }
 
-    const amounts = collectionName === 'expenses'
-      ? [String(record.amount)]
-      : [String(record.quantityLiters), String(record.unitPrice)];
+    const amounts = collectionName === 'fuelLogs'
+      ? [String(record.quantityLiters), String(record.unitPrice)]
+      : [String(record.amount)];
     if (amounts.some((amount) => amount === 'undefined' || amount === 'null')) {
       return;
     }
@@ -1975,7 +2222,7 @@ export class DashboardService {
     filters: ExpenseFilters & { warehouseId?: Types.ObjectId },
     includeFuelLogs = false,
   ): Promise<number> {
-    const expenseCount = this.db.collection('expenses').countDocuments({
+    const expenseFilter = {
       companyId,
       ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
       $expr: {
@@ -1986,7 +2233,8 @@ export class DashboardService {
       },
       $or: [{ baseAmount: null }, { baseAmount: { $exists: false } }],
       ...this.expenseDocumentFilter(filters),
-    });
+    };
+    const expenseCount = this.db.collection('expenses').countDocuments(expenseFilter);
     if (!includeFuelLogs) return expenseCount;
     const fuelLogMatch = this.fuelLogMatch({
       companyId,
@@ -1994,8 +2242,11 @@ export class DashboardService {
       ...this.expenseDocumentFilter(filters),
     });
     if (!fuelLogMatch) return expenseCount;
-    const [expenses, fuelLogs] = await Promise.all([
+    const [expenses, truckExpenses, fuelLogs] = await Promise.all([
       expenseCount,
+      'paymentStatus' in this.expenseDocumentFilter(filters)
+        ? Promise.resolve(0)
+        : this.db.collection('truckExpenses').countDocuments(expenseFilter),
       this.db.collection('fuelLogs').countDocuments({
         ...fuelLogMatch,
         expenseId: null,
@@ -2007,7 +2258,7 @@ export class DashboardService {
         },
       }),
     ]);
-    return expenses + fuelLogs;
+    return expenses + truckExpenses + fuelLogs;
   }
 
   private utcMonthStart() {

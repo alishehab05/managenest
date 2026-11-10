@@ -35,9 +35,8 @@ export class UpdateWorkerDto {
   role?: (typeof WORKER_JOB_ROLES)[number];
 
   @IsOptional()
-  @IsArray()
-  @IsIn(DRIVER_SPECIALTIES, { each: true })
-  specialties?: (typeof DRIVER_SPECIALTIES)[number][];
+  @IsIn(DRIVER_SPECIALTIES)
+  specialty?: (typeof DRIVER_SPECIALTIES)[number];
 
   @IsOptional()
   @IsIn(['active', 'suspended'])

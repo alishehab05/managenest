@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: factory-management-api
+    runtime: node
+    plan: starter
+    region: frankfurt
+    rootDir: api
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start:prod
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22.16.0
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        value: COCOA_ERP_DB
+      - key: CLERK_SECRET_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false

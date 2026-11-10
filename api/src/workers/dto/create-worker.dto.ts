@@ -28,6 +28,11 @@ export class CreateWorkerDto {
 
   @IsOptional()
   @IsArray()
-  @IsIn(DRIVER_SPECIALTIES, { each: true })
-  specialties?: (typeof DRIVER_SPECIALTIES)[number][];
+  @IsString({ each: true })
+  @Matches(/^[a-f\d]{24}$/i, { each: true })
+  warehouseIds?: string[];
+
+  @IsOptional()
+  @IsIn(DRIVER_SPECIALTIES)
+  specialty?: (typeof DRIVER_SPECIALTIES)[number];
 }

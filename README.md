@@ -43,6 +43,18 @@ The `users` collection stores the `platform_admin` and `company_manager` identit
 
 The API health endpoint is `GET /api/health`. Authenticated routes include `GET /api/session`, `PATCH /api/session/email`, `GET/POST/PATCH/DELETE /api/admin/managers`, `GET/POST/PATCH/DELETE /api/workers`, and warehouse read/create endpoints for company managers.
 
+## Deploy for worldwide access
+
+The mobile app must use a public HTTPS API; a private LAN address such as `192.168.x.x` only works on that local network. The root `render.yaml` defines a Render web service in Frankfurt with a health check and the API build/start commands.
+
+1. Push this repository to a Git provider and create a Render Blueprint from it, selecting the root `render.yaml`. The API service uses Render's paid Starter plan so it stays available instead of sleeping between requests.
+2. Set `MONGODB_URI` to the production Atlas URI and `CLERK_SECRET_KEY` to the secret key for the same Clerk production instance used by the app. Set `CORS_ORIGINS` to the exact HTTPS origin(s) of any browser-based clients; native mobile clients do not use browser CORS.
+3. In MongoDB Atlas, allow the API host's outbound IP ranges in Network Access and use a least-privilege database user. Do not expose the database to all IPs with `0.0.0.0/0`.
+4. Wait for Render's `/api/health` check to pass, then copy the service's public HTTPS URL. Set the EAS `production` variables `EXPO_PUBLIC_API_URL` to that URL followed by `/api` and `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY` to the matching Clerk `pk_live_...` key. Never put `CLERK_SECRET_KEY` in the mobile app or EAS public variables.
+5. Build and distribute a new production app from `mobile/` with `eas build --platform android --profile production` (and the corresponding iOS build if required).
+
+A public API URL makes the service reachable worldwide; choose hosting regions and database locations that meet your latency, data-residency, and availability requirements.
+
 ## Tenant and authentication rules
 
 - Mobile users authenticate with Clerk. The API verifies bearer JWTs using `CLERK_SECRET_KEY`.

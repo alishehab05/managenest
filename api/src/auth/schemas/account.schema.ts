@@ -33,8 +33,8 @@ export class Account {
   @Prop({ type: [Types.ObjectId], default: [] })
   warehouseIds: Types.ObjectId[];
 
-  @Prop({ type: [String], default: [] })
-  specialties: string[];
+  @Prop({ type: String, default: null })
+  specialty: string | null;
 
   @Prop({ default: 'active', enum: ['active', 'suspended', 'deleted'] })
   status: string;

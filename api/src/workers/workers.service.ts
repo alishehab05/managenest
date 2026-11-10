@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
@@ -38,7 +39,7 @@ export class WorkersService {
     const companyId = manager.companyId;
     return this.accounts
       .find({ companyId, status: { $ne: 'deleted' } })
-      .select('name username email phoneNumber employeeNumber role status warehouseIds specialties createdAt')
+      .select('name username email phoneNumber employeeNumber role status warehouseIds specialty createdAt')
       .sort({ name: 1 })
       .lean();
   }
@@ -60,6 +61,13 @@ export class WorkersService {
     if (duplicateUsername || duplicateEmployee) {
       throw new ConflictException('Username or employee number is already in use');
     }
+    const role = input.role?.trim() || 'worker';
+    if (role === 'driver' && input.warehouseIds?.length) {
+      throw new BadRequestException('Driver warehouse access is assigned from the driver’s truck');
+    }
+    const warehouseIds = role === 'driver'
+      ? []
+      : await this.validateWarehouseIds(companyId, input.warehouseIds ?? []);
 
     const { user, initialPassword } = await this.clerk.createManagedUser(
       input.name,
@@ -75,8 +83,9 @@ export class WorkersService {
         phoneNumber: input.phoneNumber,
         name: input.name.trim(),
         employeeNumber: input.employeeNumber.trim(),
-        role: input.role?.trim() || 'worker',
-        specialties: input.role === 'driver' ? input.specialties ?? [] : [],
+        role,
+        warehouseIds,
+        specialty: role === 'driver' ? input.specialty ?? null : null,
       });
       return {
         worker: {
@@ -89,7 +98,7 @@ export class WorkersService {
           role: account.role,
           status: account.status,
           warehouseIds: account.warehouseIds,
-          specialties: account.specialties,
+          specialty: account.specialty,
         },
         initialPassword,
         passwordNotice: 'Copy this password now. It will not be shown again.',
@@ -110,6 +119,9 @@ export class WorkersService {
 
   async update(clerkUserId: string, id: string, input: UpdateWorkerDto) {
     const manager = await this.requireManager(clerkUserId);
+    if (!manager.companyId) {
+      throw new ForbiddenException('Active company manager access required');
+    }
     if (!Types.ObjectId.isValid(id)) throw new NotFoundException('Worker not found');
     const worker = await this.accounts.findOne({
       _id: id,
@@ -117,6 +129,21 @@ export class WorkersService {
       status: { $ne: 'deleted' },
     });
     if (!worker) throw new NotFoundException('Worker not found');
+
+    const nextRole = input.role?.trim() ?? worker.role;
+    if (nextRole === 'driver' && input.warehouseIds?.length) {
+      throw new BadRequestException('Driver warehouse access is assigned from the driver’s truck');
+    }
+    if (worker.role === 'driver' && nextRole !== 'driver') {
+      const assignedTruck = await this.accounts.db.collection('trucks').findOne({
+        companyId: manager.companyId,
+        driverId: worker._id,
+        status: 'active',
+      }, { projection: { _id: 1 } });
+      if (assignedTruck) {
+        throw new ConflictException('Reassign this driver from active trucks before changing their role');
+      }
+    }
 
     if (input.username !== undefined && input.username.trim().toLowerCase() !== worker.username) {
       const username = input.username.trim().toLowerCase();
@@ -140,24 +167,21 @@ export class WorkersService {
       worker.employeeNumber = input.employeeNumber.trim();
     }
     if (input.phoneNumber !== undefined) worker.phoneNumber = input.phoneNumber.trim() || null;
-    if (input.warehouseIds !== undefined) {
-      const warehouseIds = [...new Set(input.warehouseIds)];
-      const validWarehouses = await this.accounts.db
-        .collection('warehouses')
-        .countDocuments({
-          _id: { $in: warehouseIds.map((warehouseId) => new Types.ObjectId(warehouseId)) },
-          companyId: manager.companyId,
-        });
-      if (validWarehouses !== warehouseIds.length) {
-        throw new NotFoundException('One or more warehouses were not found in this company');
-      }
-      worker.warehouseIds = warehouseIds.map((warehouseId) => new Types.ObjectId(warehouseId));
+    if (nextRole === 'driver') {
+      worker.warehouseIds = await this.getDriverWarehouseIds(manager.companyId, worker._id);
+    } else if (input.warehouseIds !== undefined) {
+      worker.warehouseIds = await this.validateWarehouseIds(
+        manager.companyId,
+        input.warehouseIds,
+      );
+    } else if (worker.role === 'driver') {
+      worker.warehouseIds = [];
     }
-    if (input.role !== undefined) worker.role = input.role.trim();
-    if (input.specialties !== undefined) {
-      worker.specialties = worker.role === 'driver' ? input.specialties : [];
+    if (input.role !== undefined) worker.role = nextRole;
+    if (input.specialty !== undefined) {
+      worker.specialty = worker.role === 'driver' ? input.specialty : null;
     } else if (input.role !== undefined && worker.role !== 'driver') {
-      worker.specialties = [];
+      worker.specialty = null;
     }
     if (input.status !== undefined && input.status !== worker.status) {
       if (input.status === 'suspended') await this.clerk.ban(worker.clerkUserId);
@@ -175,8 +199,48 @@ export class WorkersService {
       role: worker.role,
       status: worker.status,
       warehouseIds: worker.warehouseIds,
-      specialties: worker.specialties,
+      specialty: worker.specialty,
     };
+  }
+
+  private async validateWarehouseIds(
+    companyId: Types.ObjectId,
+    warehouseIdsInput: string[],
+  ) {
+    const warehouseIds = [...new Set(warehouseIdsInput)];
+    if (warehouseIds.length === 0) return [];
+
+    const validWarehouses = await this.accounts.db
+      .collection('warehouses')
+      .countDocuments({
+        _id: { $in: warehouseIds.map((warehouseId) => new Types.ObjectId(warehouseId)) },
+        companyId,
+        status: 'active',
+      });
+    if (validWarehouses !== warehouseIds.length) {
+      throw new NotFoundException('One or more warehouses were not found in this company');
+    }
+
+    return warehouseIds.map((warehouseId) => new Types.ObjectId(warehouseId));
+  }
+
+  private async getDriverWarehouseIds(
+    companyId: Types.ObjectId,
+    driverId: Types.ObjectId,
+  ): Promise<Types.ObjectId[]> {
+    const trucks = await this.accounts.db.collection('trucks')
+      .find(
+        { companyId, driverId, status: 'active' },
+        { projection: { warehouseId: 1 } },
+      )
+      .toArray();
+    return [
+      ...new Map(
+        trucks
+          .filter((truck) => truck.warehouseId instanceof Types.ObjectId)
+          .map((truck) => [truck.warehouseId.toString(), truck.warehouseId]),
+      ).values(),
+    ];
   }
 
   async remove(clerkUserId: string, id: string) {
@@ -188,6 +252,14 @@ export class WorkersService {
       status: { $ne: 'deleted' },
     });
     if (!worker) throw new NotFoundException('Worker not found');
+    const assignedTruck = await this.accounts.db.collection('trucks').findOne({
+      companyId: manager.companyId,
+      driverId: worker._id,
+      status: 'active',
+    }, { projection: { _id: 1 } });
+    if (assignedTruck) {
+      throw new ConflictException('Reassign this driver from active trucks before deleting the account');
+    }
 
     await this.clerk.ban(worker.clerkUserId);
     worker.status = 'deleted';

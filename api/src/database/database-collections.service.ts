@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectConnection } from '@nestjs/mongoose';
 import type { Connection, mongo } from 'mongoose';
+import { Types } from 'mongoose';
 import { ClerkUsersService } from '../auth/clerk-users.service.js';
 import { ERP_COLLECTIONS } from './erp-collections.js';
 
@@ -50,6 +51,9 @@ export class DatabaseCollectionsService implements OnModuleInit {
     const missing = ERP_COLLECTIONS.filter((name) => !existing.has(name));
     await Promise.all(missing.map((name) => database.createCollection(name)));
     await this.migrateLegacyWarehouseCompanyIds(database);
+    await this.migrateTruckExpenseWarehouseIds(database);
+    await this.migrateLegacyWorkerSpecialties(database);
+    await this.syncDriverWarehouseAssignments(database);
     await this.backfillLegacyUsernames(database.collection('users'));
     await this.backfillLegacyUsernames(database.collection('accounts'));
 
@@ -74,6 +78,120 @@ export class DatabaseCollectionsService implements OnModuleInit {
       this.logger.log(
         `Normalized company ownership on ${result.modifiedCount} legacy warehouse record(s).`,
       );
+    }
+  }
+
+  private async migrateLegacyWorkerSpecialties(database: mongo.Db): Promise<void> {
+    const result = await database.collection('accounts').updateMany(
+      { specialties: { $exists: true } },
+      [
+        {
+          $set: {
+            specialty: {
+              $cond: [
+                { $eq: ['$role', 'driver'] },
+                {
+                  $ifNull: [
+                    '$specialty',
+                    { $arrayElemAt: [{ $ifNull: ['$specialties', []] }, 0] },
+                  ],
+                },
+                null,
+              ],
+            },
+          },
+        },
+        { $unset: 'specialties' },
+      ],
+    );
+    if (result.modifiedCount > 0) {
+      this.logger.log(
+        `Migrated the legacy specialties field on ${result.modifiedCount} worker account(s).`,
+      );
+    }
+  }
+
+  private async migrateTruckExpenseWarehouseIds(database: mongo.Db): Promise<void> {
+    let migratedCount = 0;
+    for (const [collectionName, truckField] of [
+      ['truckExpenses', 'truckId'],
+      ['fuelLogs', 'truckId'],
+      ['expenses', 'costCenterId'],
+    ]) {
+      const filter: Record<string, unknown> = {
+        [truckField]: { $type: 'objectId' },
+        $or: [
+          { warehouseId: { $exists: false } },
+          { warehouseId: { $not: { $type: 'objectId' } } },
+        ],
+        ...(collectionName === 'expenses' ? { costCenterType: 'truck' } : {}),
+      };
+      const records = await database.collection(collectionName)
+        .find(filter, { projection: { companyId: 1, [truckField]: 1 } })
+        .toArray();
+      for (const record of records) {
+        if (!(record.companyId instanceof Types.ObjectId)) continue;
+        const truck = await database.collection('trucks').findOne(
+          {
+            _id: record[truckField],
+            companyId: record.companyId,
+            warehouseId: { $type: 'objectId' },
+          },
+          { projection: { warehouseId: 1 } },
+        );
+        if (!(truck?.warehouseId instanceof Types.ObjectId)) continue;
+        const result = await database.collection(collectionName).updateOne(
+          { _id: record._id, companyId: record.companyId },
+          { $set: { warehouseId: truck.warehouseId, updatedAt: new Date() } },
+        );
+        migratedCount += result.modifiedCount;
+      }
+    }
+    if (migratedCount > 0) {
+      this.logger.log(`Repaired warehouse links on ${migratedCount} truck expense record(s).`);
+    }
+  }
+
+  private async syncDriverWarehouseAssignments(database: mongo.Db): Promise<void> {
+    const trucks = await database.collection('trucks')
+      .find(
+        { status: 'active', driverId: { $type: 'objectId' } },
+        { projection: { companyId: 1, driverId: 1, warehouseId: 1 } },
+      )
+      .toArray();
+    const warehousesByDriver = new Map<string, {
+      companyId: Types.ObjectId;
+      driverId: Types.ObjectId;
+      warehouseIds: Map<string, Types.ObjectId>;
+    }>();
+    for (const truck of trucks) {
+      if (
+        !(truck.companyId instanceof Types.ObjectId) ||
+        !(truck.driverId instanceof Types.ObjectId) ||
+        !(truck.warehouseId instanceof Types.ObjectId)
+      ) continue;
+      const key = `${truck.companyId.toString()}:${truck.driverId.toString()}`;
+      const assignment = warehousesByDriver.get(key) ?? {
+        companyId: truck.companyId,
+        driverId: truck.driverId,
+        warehouseIds: new Map<string, Types.ObjectId>(),
+      };
+      assignment.warehouseIds.set(truck.warehouseId.toString(), truck.warehouseId);
+      warehousesByDriver.set(key, assignment);
+    }
+
+    await database.collection('accounts').updateMany(
+      { role: 'driver' },
+      { $set: { warehouseIds: [] } },
+    );
+    for (const { companyId, driverId, warehouseIds } of warehousesByDriver.values()) {
+      await database.collection('accounts').updateOne(
+        { _id: driverId, companyId, role: 'driver' },
+        { $set: { warehouseIds: [...warehouseIds.values()] } },
+      );
+    }
+    if (warehousesByDriver.size > 0) {
+      this.logger.log(`Synchronized warehouse access for ${warehousesByDriver.size} assigned driver(s).`);
     }
   }
 

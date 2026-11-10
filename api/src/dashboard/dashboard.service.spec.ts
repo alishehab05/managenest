@@ -37,22 +37,34 @@ describe('DashboardService', () => {
       costCenterId: truckId,
     }];
     expenseCollection = {
-      aggregate: vi.fn().mockReturnValue({
-        toArray: vi.fn().mockResolvedValue([{
-          total: Types.Decimal128.fromString('125.50'),
-        }]),
+      aggregate: vi.fn((pipeline: Record<string, unknown>[]) => {
+        const lastStage = pipeline[pipeline.length - 1];
+        const rows = '$count' in lastStage
+          ? [{ count: 1 }]
+          : '$limit' in lastStage
+            ? records
+            : [{ total: Types.Decimal128.fromString('125.50') }];
+        return { toArray: vi.fn().mockResolvedValue(rows) };
       }),
-      find: vi.fn().mockReturnValue({
+      find: vi.fn((filter: Record<string, unknown> = {}) => ({
         sort: vi.fn().mockReturnValue({
           limit: vi.fn().mockReturnValue({
-            toArray: vi.fn().mockResolvedValue(records),
+            toArray: vi.fn().mockResolvedValue('currencyCode' in filter ? [] : records),
           }),
         }),
-      }),
-      countDocuments: vi.fn().mockResolvedValue(1),
+      })),
+      countDocuments: vi.fn().mockResolvedValue(0),
     };
     warehouseCollection = {
       findOne: vi.fn().mockResolvedValue(null),
+      find: vi.fn(() => ({
+        sort: vi.fn().mockReturnValue({
+          limit: vi.fn().mockReturnValue({
+            toArray: vi.fn().mockResolvedValue([]),
+          }),
+        }),
+      })),
+      countDocuments: vi.fn().mockResolvedValue(0),
     };
     const db = {
       collection: vi.fn((name: string) =>
@@ -75,7 +87,7 @@ describe('DashboardService', () => {
       paymentStatus: 'paid',
     });
 
-    expect(expenseCollection.find).toHaveBeenCalledWith(expect.objectContaining({
+    expect(expenseCollection.aggregate.mock.calls[1][0][0].$match).toEqual(expect.objectContaining({
       companyId,
       category: 'fuel',
       truckId,
@@ -90,7 +102,7 @@ describe('DashboardService', () => {
       count: 1,
       limit: 200,
       currencyCode: 'USD',
-      unconvertedCount: 1,
+      unconvertedCount: 0,
       records: [{
         id: expenseId.toString(),
         category: 'fuel',
@@ -103,6 +115,87 @@ describe('DashboardService', () => {
       $eq: [{ $toUpper: '$currencyCode' }, 'USD'],
     });
     expect(sumExpression.$cond[2].$convert.input).toBe('$baseAmount');
+  });
+
+  it('converts legacy expenses before calculating company expense totals', async () => {
+    const legacyExpense = {
+      _id: expenseId,
+      companyId,
+      amount: Types.Decimal128.fromString('10.00'),
+      currencyCode: 'EUR',
+      incurredAt,
+      baseAmount: null,
+    };
+    const expenseCollection = {
+      find: vi.fn((filter: Record<string, unknown> = {}) => ({
+        sort: vi.fn().mockReturnValue({
+          limit: vi.fn().mockReturnValue({
+            toArray: vi.fn().mockResolvedValue('currencyCode' in filter ? [legacyExpense] : []),
+          }),
+        }),
+      })),
+      updateOne: vi.fn().mockResolvedValue({ modifiedCount: 1 }),
+      countDocuments: vi.fn().mockResolvedValue(0),
+      aggregate: vi.fn((pipeline: Record<string, unknown>[]) => {
+        const lastStage = pipeline[pipeline.length - 1];
+        const rows = '$count' in lastStage
+          ? [{ count: 0 }]
+          : '$limit' in lastStage
+            ? []
+            : [{ total: Types.Decimal128.fromString('8.00') }];
+        return { toArray: vi.fn().mockResolvedValue(rows) };
+      }),
+    };
+    const otherCollection = {
+      find: vi.fn(() => ({
+        sort: vi.fn().mockReturnValue({
+          limit: vi.fn().mockReturnValue({
+            toArray: vi.fn().mockResolvedValue([]),
+          }),
+        }),
+      })),
+      countDocuments: vi.fn().mockResolvedValue(0),
+    };
+    const companiesCollection = {
+      findOne: vi.fn().mockResolvedValue({ baseCurrencyCode: 'GBP' }),
+    };
+    const db = {
+      collection: vi.fn((name: string) => {
+        if (name === 'expenses') return expenseCollection;
+        if (name === 'companies') return companiesCollection;
+        return otherCollection;
+      }),
+    };
+    const connection = { db } as unknown as Connection;
+    const companies = {
+      requireCompanyId: vi.fn().mockResolvedValue(companyId.toString()),
+    } as unknown as CompaniesService;
+    const moduleService = new DashboardService(connection, companies);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ date: '2025-03-14', rates: { GBP: 0.8 } }),
+    }));
+
+    const result = await moduleService.getCompanyExpenses('clerk-user');
+
+    expect(result).toMatchObject({
+      total: 8,
+      currencyCode: 'GBP',
+      unconvertedCount: 0,
+    });
+    expect(expenseCollection.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({ _id: expenseId, companyId, baseAmount: null }),
+      expect.objectContaining({
+        $set: expect.objectContaining({
+          baseAmount: Types.Decimal128.fromString('8.00'),
+          exchangeRate: Types.Decimal128.fromString('0.8000000000'),
+        }),
+      }),
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      'https://api.frankfurter.dev/v1/2025-03-14?base=EUR&symbols=GBP',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
   });
 
   it('rejects invalid expense filter identifiers', async () => {
@@ -284,19 +377,25 @@ describe('DashboardService', () => {
 
   it('returns only active company expense categories for category dropdowns', async () => {
     const categoryId = new Types.ObjectId('65a000000000000000000099');
+    const categoryRecord = {
+      _id: categoryId,
+      companyId,
+      name: 'Packaging',
+      status: 'active',
+    };
     const categories = {
-      find: vi.fn().mockReturnValue({
-        sort: vi.fn().mockReturnValue({
-          limit: vi.fn().mockReturnValue({
-            toArray: vi.fn().mockResolvedValue([{
-              _id: categoryId,
-              companyId,
-              name: 'Packaging',
-              status: 'active',
-            }]),
+      find: vi.fn()
+        .mockReturnValueOnce({
+          toArray: vi.fn().mockResolvedValue([categoryRecord]),
+        })
+        .mockReturnValue({
+          sort: vi.fn().mockReturnValue({
+            limit: vi.fn().mockReturnValue({
+              toArray: vi.fn().mockResolvedValue([categoryRecord]),
+            }),
           }),
         }),
-      }),
+      updateOne: vi.fn().mockResolvedValue({ upsertedCount: 1 }),
     };
     const db = { collection: vi.fn(() => categories) };
     const connection = { db } as unknown as Connection;
@@ -308,7 +407,31 @@ describe('DashboardService', () => {
     const result = await moduleService.getCompanyModuleOptions('clerk-user', 'expenseCategories');
 
     expect(db.collection).toHaveBeenCalledWith('expenseCategories');
-    expect(categories.find).toHaveBeenCalledWith({ companyId, status: 'active' });
+    expect(categories.find).toHaveBeenNthCalledWith(1, { companyId }, {
+      projection: { name: 1, code: 1 },
+    });
+    expect(categories.find).toHaveBeenNthCalledWith(2, {
+      companyId,
+      $or: [
+        { status: 'active' },
+        { status: { $exists: false } },
+        { status: null },
+      ],
+    });
+    expect(categories.updateOne).toHaveBeenCalledWith(
+      { companyId, code: 'FUEL' },
+      {
+        $setOnInsert: expect.objectContaining({
+          companyId,
+          code: 'FUEL',
+          name: 'Fuel',
+          status: 'active',
+          createdAt: expect.any(Date),
+          updatedAt: expect.any(Date),
+        }),
+      },
+      { upsert: true },
+    );
     expect(result).toEqual([{
       _id: categoryId.toString(),
       companyId: companyId.toString(),
@@ -427,6 +550,212 @@ describe('DashboardService', () => {
     expect(moduleCollection.findOne).toHaveBeenCalledWith({ _id: expenseId, companyId });
   });
 
+  it('defaults newly created expense categories to active', async () => {
+    const categories = {
+      insertOne: vi.fn().mockResolvedValue({ insertedId: expenseId }),
+      findOne: vi.fn().mockResolvedValue({
+        _id: expenseId,
+        companyId,
+        name: 'Fuel',
+        status: 'active',
+      }),
+    };
+    const db = { collection: vi.fn(() => categories) };
+    const connection = { db } as unknown as Connection;
+    const companies = {
+      requireCompanyId: vi.fn().mockResolvedValue(companyId.toString()),
+    } as unknown as CompaniesService;
+    const moduleService = new DashboardService(connection, companies);
+
+    await moduleService.createCompanyModuleRecord('clerk-user', 'expenseCategories', {
+      name: 'Fuel',
+    });
+
+    expect(categories.insertOne).toHaveBeenCalledWith(expect.objectContaining({
+      companyId,
+      name: 'Fuel',
+      status: 'active',
+    }));
+  });
+
+  it('assigns a new fuel log to its truck warehouse without requiring a warehouse input', async () => {
+    const warehouseId = new Types.ObjectId('65a000000000000000000004');
+    const truck = { _id: truckId, companyId, warehouseId, status: 'active' };
+    const savedFuelLog = { _id: expenseId, companyId, truckId, warehouseId };
+    const fuelLogs = {
+      insertOne: vi.fn().mockResolvedValue({ insertedId: expenseId }),
+      findOne: vi.fn().mockResolvedValue(savedFuelLog),
+    };
+    const trucks = { findOne: vi.fn().mockResolvedValue(truck) };
+    const companiesCollection = {
+      findOne: vi.fn().mockResolvedValue({ baseCurrencyCode: 'USD' }),
+    };
+    const db = {
+      collection: vi.fn((name: string) => {
+        if (name === 'fuelLogs') return fuelLogs;
+        if (name === 'trucks') return trucks;
+        return companiesCollection;
+      }),
+    };
+    const connection = { db } as unknown as Connection;
+    const companies = {
+      requireCompanyId: vi.fn().mockResolvedValue(companyId.toString()),
+    } as unknown as CompaniesService;
+    const moduleService = new DashboardService(connection, companies);
+
+    await moduleService.createCompanyModuleRecord('clerk-user', 'fuelLogs', {
+      truckId: truckId.toString(),
+      quantityLiters: '20',
+      unitPrice: '1.50',
+      currencyCode: 'USD',
+    });
+
+    expect(fuelLogs.insertOne).toHaveBeenCalledWith(expect.objectContaining({
+      companyId,
+      truckId,
+      warehouseId,
+      baseAmount: Types.Decimal128.fromString('30.00'),
+    }));
+  });
+
+  it('preserves the stored truck warehouse when partially updating a fuel log', async () => {
+    const warehouseId = new Types.ObjectId('65a000000000000000000004');
+    const existing = {
+      _id: expenseId,
+      companyId,
+      truckId,
+      warehouseId,
+      quantityLiters: Types.Decimal128.fromString('20'),
+      unitPrice: Types.Decimal128.fromString('1.50'),
+      currencyCode: 'USD',
+    };
+    const updated = { ...existing, unitPrice: Types.Decimal128.fromString('1.75') };
+    const fuelLogs = {
+      findOne: vi.fn()
+        .mockResolvedValueOnce(existing)
+        .mockResolvedValueOnce(existing)
+        .mockResolvedValueOnce(updated),
+      updateOne: vi.fn().mockResolvedValue({ matchedCount: 1 }),
+    };
+    const companiesCollection = {
+      findOne: vi.fn().mockResolvedValue({ baseCurrencyCode: 'USD' }),
+    };
+    const db = {
+      collection: vi.fn((name: string) => name === 'fuelLogs' ? fuelLogs : companiesCollection),
+    };
+    const connection = { db } as unknown as Connection;
+    const companies = {
+      requireCompanyId: vi.fn().mockResolvedValue(companyId.toString()),
+    } as unknown as CompaniesService;
+    const moduleService = new DashboardService(connection, companies);
+
+    await moduleService.updateCompanyModuleRecord(
+      'clerk-user',
+      'fuelLogs',
+      expenseId.toString(),
+      { unitPrice: '1.75' },
+    );
+
+    expect(fuelLogs.updateOne).toHaveBeenCalledWith(
+      { _id: expenseId, companyId },
+      { $set: expect.objectContaining({ warehouseId, unitPrice: Types.Decimal128.fromString('1.75') }) },
+    );
+  });
+
+  it('preserves the stored truck warehouse when partially updating a truck expense', async () => {
+    const warehouseId = new Types.ObjectId('65a000000000000000000004');
+    const existing = {
+      _id: expenseId,
+      companyId,
+      warehouseId,
+      costCenterType: 'truck',
+      costCenterId: truckId,
+      amount: Types.Decimal128.fromString('10.00'),
+      currencyCode: 'USD',
+    };
+    const expenses = {
+      findOne: vi.fn()
+        .mockResolvedValueOnce(existing)
+        .mockResolvedValueOnce(existing)
+        .mockResolvedValueOnce({ ...existing, amount: Types.Decimal128.fromString('12.50') }),
+      updateOne: vi.fn().mockResolvedValue({ matchedCount: 1 }),
+    };
+    const companiesCollection = {
+      findOne: vi.fn().mockResolvedValue({ baseCurrencyCode: 'USD' }),
+    };
+    const db = {
+      collection: vi.fn((name: string) => name === 'expenses' ? expenses : companiesCollection),
+    };
+    const connection = { db } as unknown as Connection;
+    const companies = {
+      requireCompanyId: vi.fn().mockResolvedValue(companyId.toString()),
+    } as unknown as CompaniesService;
+    const moduleService = new DashboardService(connection, companies);
+
+    await moduleService.updateCompanyModuleRecord(
+      'clerk-user',
+      'expenses',
+      expenseId.toString(),
+      { amount: '12.50' },
+    );
+
+    expect(expenses.updateOne).toHaveBeenCalledWith(
+      { _id: expenseId, companyId },
+      { $set: expect.objectContaining({ warehouseId, amount: Types.Decimal128.fromString('12.50') }) },
+    );
+  });
+
+  it('synchronizes driver warehouse access when a truck assignment changes', async () => {
+    const oldDriverId = new Types.ObjectId('65a000000000000000000010');
+    const newDriverId = new Types.ObjectId('65a000000000000000000011');
+    const oldWarehouseId = new Types.ObjectId('65a000000000000000000012');
+    const newWarehouseId = new Types.ObjectId('65a000000000000000000013');
+    const existing = { _id: truckId, driverId: oldDriverId, warehouseId: oldWarehouseId };
+    const updated = { _id: truckId, driverId: newDriverId, warehouseId: newWarehouseId };
+    const trucks = {
+      findOne: vi.fn().mockResolvedValueOnce(existing).mockResolvedValueOnce(updated),
+      updateOne: vi.fn().mockResolvedValue({ matchedCount: 1 }),
+      find: vi.fn().mockImplementation(({ driverId }) => ({
+        toArray: vi.fn().mockResolvedValue(
+          driverId.equals(newDriverId) ? [{ warehouseId: newWarehouseId }] : [],
+        ),
+      })),
+    };
+    const warehouses = { findOne: vi.fn().mockResolvedValue({ _id: newWarehouseId }) };
+    const accounts = {
+      findOne: vi.fn().mockResolvedValue({ _id: newDriverId }),
+      updateOne: vi.fn().mockResolvedValue({ matchedCount: 1 }),
+    };
+    const db = {
+      collection: vi.fn((name: string) => {
+        if (name === 'trucks') return trucks;
+        if (name === 'warehouses') return warehouses;
+        return accounts;
+      }),
+    };
+    const connection = { db } as unknown as Connection;
+    const companies = {
+      requireCompanyId: vi.fn().mockResolvedValue(companyId.toString()),
+    } as unknown as CompaniesService;
+    const moduleService = new DashboardService(connection, companies);
+
+    await moduleService.updateCompanyModuleRecord('clerk-user', 'trucks', truckId.toString(), {
+      driverId: newDriverId.toString(),
+      warehouseId: newWarehouseId.toString(),
+    });
+
+    expect(accounts.updateOne).toHaveBeenCalledWith(
+      { _id: oldDriverId, companyId, role: 'driver' },
+      { $set: { warehouseIds: [], updatedAt: expect.any(Date) } },
+      {},
+    );
+    expect(accounts.updateOne).toHaveBeenCalledWith(
+      { _id: newDriverId, companyId, role: 'driver' },
+      { $set: { warehouseIds: [newWarehouseId], updatedAt: expect.any(Date) } },
+      {},
+    );
+  });
+
   it('falls back to the latest published rate when historical data is unavailable', async () => {
     const warehouseId = new Types.ObjectId('65a000000000000000000004');
     const expenses = {
@@ -439,6 +768,13 @@ describe('DashboardService', () => {
     const references = {
       findOne: vi.fn().mockImplementation(({ _id }) => Promise.resolve({ _id })),
     };
+    const trucks = {
+      findOne: vi.fn().mockResolvedValue({
+        _id: truckId,
+        warehouseId,
+        status: 'active',
+      }),
+    };
     const fetchMock = vi.fn()
       .mockResolvedValueOnce({ ok: false, status: 404 })
       .mockResolvedValueOnce({
@@ -450,6 +786,7 @@ describe('DashboardService', () => {
       collection: vi.fn((name: string) => {
         if (name === 'expenses') return expenses;
         if (name === 'companies') return companiesCollection;
+        if (name === 'trucks') return trucks;
         return references;
       }),
     };
@@ -498,6 +835,16 @@ describe('DashboardService', () => {
       updateOne: vi.fn().mockResolvedValue({ modifiedCount: 1 }),
       countDocuments: vi.fn().mockResolvedValue(0),
     };
+    const truckExpenses = {
+      find: vi.fn().mockReturnValue({
+        sort: vi.fn().mockReturnValue({
+          limit: vi.fn().mockReturnValue({
+            toArray: vi.fn().mockResolvedValue([]),
+          }),
+        }),
+      }),
+      countDocuments: vi.fn().mockResolvedValue(0),
+    };
     const expenses = {
       find: vi.fn().mockReturnValue({
         sort: vi.fn().mockReturnValue({
@@ -515,6 +862,7 @@ describe('DashboardService', () => {
       collection: vi.fn((name: string) => {
         if (name === 'fuelLogs') return fuelLogs;
         if (name === 'expenses') return expenses;
+        if (name === 'truckExpenses') return truckExpenses;
         return companiesCollection;
       }),
     };
@@ -619,7 +967,7 @@ describe('DashboardService', () => {
       costCenterId: '65a000000000000000000099',
       amount: '10.00',
       currencyCode: 'USD',
-    })).rejects.toThrow('record in your company');
+    })).rejects.toThrow('active company truck with a warehouse');
     expect(expenseCollection.insertOne).not.toHaveBeenCalled();
   });
 
@@ -637,12 +985,17 @@ describe('DashboardService', () => {
   it('transfers a truck and records the move without rewriting history', async () => {
     const oldWarehouseId = new Types.ObjectId('65a000000000000000000005');
     const newWarehouseId = new Types.ObjectId('65a000000000000000000006');
+    const driverId = new Types.ObjectId('65a000000000000000000007');
     const truckCollection = {
-      findOne: vi.fn().mockResolvedValue({ warehouseId: oldWarehouseId, assetId: null }),
+      findOne: vi.fn().mockResolvedValue({ warehouseId: oldWarehouseId, assetId: null, driverId }),
       updateOne: vi.fn().mockResolvedValue({ matchedCount: 1 }),
+      find: vi.fn().mockReturnValue({
+        toArray: vi.fn().mockResolvedValue([{ warehouseId: newWarehouseId }]),
+      }),
     };
     const warehouses = { findOne: vi.fn().mockResolvedValue({ _id: newWarehouseId }) };
     const movementCollection = { insertOne: vi.fn().mockResolvedValue({ insertedId: expenseId }) };
+    const accounts = { updateOne: vi.fn().mockResolvedValue({ matchedCount: 1 }) };
     const session = {
       withTransaction: vi.fn(async (callback: () => Promise<void>) => callback()),
       endSession: vi.fn().mockResolvedValue(undefined),
@@ -651,6 +1004,7 @@ describe('DashboardService', () => {
       collection: vi.fn((name: string) => {
         if (name === 'trucks') return truckCollection;
         if (name === 'warehouses') return warehouses;
+        if (name === 'accounts') return accounts;
         return movementCollection;
       }),
     };
@@ -674,6 +1028,11 @@ describe('DashboardService', () => {
         toWarehouseId: newWarehouseId,
         movementType: 'warehouse_transfer',
       }),
+      { session },
+    );
+    expect(accounts.updateOne).toHaveBeenCalledWith(
+      { _id: driverId, companyId, role: 'driver' },
+      { $set: { warehouseIds: [newWarehouseId], updatedAt: expect.any(Date) } },
       { session },
     );
     expect(db.collection).not.toHaveBeenCalledWith('expenses');
@@ -712,6 +1071,11 @@ describe('DashboardService', () => {
       aggregate: vi.fn().mockReturnValue(emptyCursor),
       countDocuments: vi.fn().mockResolvedValue(0),
       distinct: vi.fn().mockResolvedValue([]),
+      find: vi.fn().mockReturnValue({
+        sort: vi.fn().mockReturnValue({
+          limit: vi.fn().mockReturnValue(emptyCursor),
+        }),
+      }),
     };
     const db = {
       collection: vi.fn((name: string) => {
@@ -747,6 +1111,11 @@ describe('DashboardService', () => {
     expect(pipelines.every((pipeline) =>
       pipeline.some((stage: { $unionWith?: { coll: string } }) =>
         stage.$unionWith?.coll === 'fuelLogs',
+      ),
+    )).toBe(true);
+    expect(pipelines.every((pipeline) =>
+      pipeline.some((stage: { $unionWith?: { coll: string } }) =>
+        stage.$unionWith?.coll === 'truckExpenses',
       ),
     )).toBe(true);
     const fuelLogUnion = pipelines[0].find(

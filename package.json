@@ -5,7 +5,8 @@
     "dev:api": "npm --prefix api run start:dev",
     "dev:mobile": "npm --prefix mobile run start",
     "build:api": "npm --prefix api run build",
-    "check:mobile": "npm --prefix mobile run typecheck"
+    "check:mobile": "npm --prefix mobile run typecheck",
+    "build:android": "npm --prefix mobile run build:android"
   },
   "devDependencies": {
     "@types/react": "~19.3.0",
