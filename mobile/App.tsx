@@ -865,13 +865,23 @@ function AppShell() {
         clearTimeout(requestTimeout);
       }
       if (!response.ok) {
-        if (response.status === 401) {
-          throw new Error('Your session has expired. Please sign out and sign in again.');
-        }
         const body = (await response.json().catch(() => ({}))) as ApiError;
         const message = Array.isArray(body.message)
           ? body.message.join(', ')
           : body.message;
+        if (response.status === 401) {
+          if (message === 'Invalid or expired Clerk token') {
+            throw new Error(
+              'The API rejected your Clerk session. Sign out and sign in again. If this continues, check that Render CLERK_SECRET_KEY belongs to the same Clerk instance as this app’s publishable key (pk_test with sk_test, or pk_live with sk_live).',
+            );
+          }
+          if (message === 'Authentication is not configured') {
+            throw new Error(
+              'API authentication is not configured. Set CLERK_SECRET_KEY in the Render environment using the secret key from this app’s Clerk instance.',
+            );
+          }
+          throw new Error(message || 'Your session is not authorized. Sign out and sign in again.');
+        }
         throw new Error(message || `Request failed (${response.status})`);
       }
       return response.json() as Promise<T>;
