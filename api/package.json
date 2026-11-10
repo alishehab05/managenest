@@ -13,7 +13,7 @@
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
-    "start:prod": "node dist/main",
+    "start:prod": "node dist/main.js",
     "seed:admin": "npm run build && node --env-file=.env --env-file=.admin-bootstrap.env dist/scripts/seed-platform-admin.js",
     "lint": "oxlint src/ test/",
     "test": "vitest run",

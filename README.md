@@ -47,7 +47,11 @@ The API health endpoint is `GET /api/health`. Authenticated routes include `GET 
 
 The mobile app must use a public HTTPS API; a private LAN address such as `192.168.x.x` only works on that local network. The root `render.yaml` defines a Render web service in Frankfurt with a health check and the API build/start commands.
 
-1. Push this repository to a Git provider and create a Render Blueprint from it, selecting the root `render.yaml`. The API service uses Render's paid Starter plan so it stays available instead of sleeping between requests.
+1. Push this repository to a Git provider and create or sync a Render Blueprint from the root `render.yaml`. The service is configured on Render's free plan; free instances may spin down when idle, so the first request after inactivity can be delayed. To avoid cold starts, select a paid plan in Render.
+   - Root Directory: `api`
+   - Build Command: `npm ci --include=dev && npm run build && npm prune --omit=dev`
+   - Start Command: `npm run start:prod` (runs `node dist/main.js`)
+   If the existing service still runs `yarn start` from the repository root, update its Render service settings to these values or create/sync it from the Blueprint; changing `render.yaml` alone does not override unsynced dashboard settings.
 2. Set `MONGODB_URI` to the production Atlas URI and `CLERK_SECRET_KEY` to the secret key for the same Clerk production instance used by the app. Set `CORS_ORIGINS` to the exact HTTPS origin(s) of any browser-based clients; native mobile clients do not use browser CORS.
 3. In MongoDB Atlas, allow the API host's outbound IP ranges in Network Access and use a least-privilege database user. Do not expose the database to all IPs with `0.0.0.0/0`.
 4. Wait for Render's `/api/health` check to pass, then copy the service's public HTTPS URL. Set the EAS `production` variables `EXPO_PUBLIC_API_URL` to that URL followed by `/api` and `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY` to the matching Clerk `pk_live_...` key. Never put `CLERK_SECRET_KEY` in the mobile app or EAS public variables.
